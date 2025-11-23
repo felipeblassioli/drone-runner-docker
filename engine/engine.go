@@ -30,12 +30,16 @@ import (
 // Opts configures the Docker engine.
 type Opts struct {
 	HidePull bool
+	Debug    bool
+	Trace    bool
 }
 
 // Docker implements a Docker pipeline engine.
 type Docker struct {
 	client   client.APIClient
 	hidePull bool
+	debug    bool
+	trace    bool
 }
 
 // New returns a new engine.
@@ -43,6 +47,8 @@ func New(client client.APIClient, opts Opts) *Docker {
 	return &Docker{
 		client:   client,
 		hidePull: opts.HidePull,
+		debug:    opts.Debug,
+		trace:    opts.Trace,
 	}
 }
 
@@ -50,7 +56,18 @@ func New(client client.APIClient, opts Opts) *Docker {
 func NewEnv(opts Opts) (*Docker, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
+		if opts.Trace {
+			logger.Default.Tracef("docker client: initialization error: %s", err)
+		}
 		return nil, err
+	}
+	if opts.Debug {
+		host := os.Getenv("DOCKER_HOST")
+		if host == "" {
+			host = "default"
+		}
+		tls := os.Getenv("DOCKER_TLS_VERIFY") == "1" || os.Getenv("DOCKER_CERT_PATH") != ""
+		logger.Default.Debugf("docker client: host=%s tls=%v api_version=%s", host, tls, cli.ClientVersion())
 	}
 	return New(cli, opts), nil
 }
@@ -71,6 +88,9 @@ func (e *Docker) Setup(ctx context.Context, specv runtime.Spec) error {
 		if vol.EmptyDir == nil {
 			continue
 		}
+		if e.debug {
+			logger.FromContext(ctx).Debugf("setup: creating volume name=%s", vol.EmptyDir.ID)
+		}
 		_, err := e.client.VolumeCreate(ctx, volume.VolumeCreateBody{
 			Name:   vol.EmptyDir.ID,
 			Driver: "local",
@@ -78,6 +98,9 @@ func (e *Docker) Setup(ctx context.Context, specv runtime.Spec) error {
 		})
 		if err != nil {
 			return errors.TrimExtraInfo(err)
+		}
+		if e.debug {
+			logger.FromContext(ctx).Debugf("setup: volume created name=%s", vol.EmptyDir.ID)
 		}
 	}
 
@@ -87,11 +110,22 @@ func (e *Docker) Setup(ctx context.Context, specv runtime.Spec) error {
 	if spec.Platform.OS == "windows" {
 		driver = "nat"
 	}
+	if e.debug {
+		logger.FromContext(ctx).Debugf("setup: creating network id=%s driver=%s", spec.Network.ID, driver)
+	}
+	if e.trace {
+		logger.FromContext(ctx).Tracef("setup: network create request driver=%s options=%v", driver, spec.Network.Options)
+	}
 	_, err := e.client.NetworkCreate(ctx, spec.Network.ID, types.NetworkCreate{
 		Driver:  driver,
 		Options: spec.Network.Options,
 		Labels:  spec.Network.Labels,
 	})
+	if err == nil && e.debug {
+		logger.FromContext(ctx).Debugf("setup: network created id=%s", spec.Network.ID)
+	} else if err != nil && e.trace {
+		logger.FromContext(ctx).Tracef("setup: network create error: %s", err.Error())
+	}
 
 	// launches the inernal setup steps
 	for _, step := range spec.Internal {
@@ -147,6 +181,9 @@ func (e *Docker) Destroy(ctx context.Context, specv runtime.Spec) error {
 
 	// cleanup all containers
 	for _, step := range append(spec.Steps, spec.Internal...) {
+		if e.debug {
+			logger.FromContext(ctx).WithField("container", step.ID).Debugln("destroy: removing container")
+		}
 		if err := e.client.ContainerRemove(ctx, step.ID, removeOpts); err != nil && !client.IsErrNotFound(err) {
 			logger.FromContext(ctx).
 				WithError(err).
@@ -165,6 +202,9 @@ func (e *Docker) Destroy(ctx context.Context, specv runtime.Spec) error {
 		if vol.EmptyDir.Medium == "memory" {
 			continue
 		}
+		if e.debug {
+			logger.FromContext(ctx).WithField("volume", vol.EmptyDir.ID).Debugln("destroy: removing volume")
+		}
 		if err := e.client.VolumeRemove(ctx, vol.EmptyDir.ID, true); err != nil {
 			logger.FromContext(ctx).
 				WithError(err).
@@ -174,6 +214,9 @@ func (e *Docker) Destroy(ctx context.Context, specv runtime.Spec) error {
 	}
 
 	// cleanup the network
+	if e.debug {
+		logger.FromContext(ctx).WithField("network", spec.Network.ID).Debugln("destroy: removing network")
+	}
 	if err := e.client.NetworkRemove(ctx, spec.Network.ID); err != nil {
 		logger.FromContext(ctx).
 			WithError(err).
@@ -194,13 +237,25 @@ func (e *Docker) Run(ctx context.Context, specv runtime.Spec, stepv runtime.Step
 	step := stepv.(*Step)
 
 	// create the container
+	if e.debug {
+		logger.FromContext(ctx).WithField("step", step.Name).WithField("action", "create").Debugf("container_id=%s", step.ID)
+	}
 	err := e.create(ctx, spec, step, output)
 	if err != nil {
+		if e.trace {
+			logger.FromContext(ctx).WithField("step", step.Name).Tracef("container create error: %s", err.Error())
+		}
 		return nil, errors.TrimExtraInfo(err)
 	}
 	// start the container
+	if e.debug {
+		logger.FromContext(ctx).WithField("step", step.Name).WithField("action", "start").Debugf("container_id=%s", step.ID)
+	}
 	err = e.start(ctx, step.ID)
 	if err != nil {
+		if e.trace {
+			logger.FromContext(ctx).WithField("step", step.Name).Tracef("container start error: %s", err.Error())
+		}
 		return nil, errors.TrimExtraInfo(err)
 	}
 	// this is an experimental feature that closes logging as the last step
@@ -216,13 +271,24 @@ func (e *Docker) Run(ctx context.Context, specv runtime.Spec, stepv runtime.Step
 		}
 		defer logs.Close()
 	} else {
+		if e.debug {
+			logger.FromContext(ctx).WithField("step", step.Name).WithField("action", "logs").Debugln("streaming=true")
+		}
 		err = e.tail(ctx, step.ID, output)
 		if err != nil {
 			return nil, errors.TrimExtraInfo(err)
 		}
 	}
 	// wait for the response
-	return e.waitRetry(ctx, step.ID)
+	if e.debug {
+		logger.FromContext(ctx).WithField("step", step.Name).WithField("action", "wait").Debugln("waiting")
+	}
+	start := time.Now()
+	state, err := e.waitRetry(ctx, step.ID)
+	if e.trace {
+		logger.FromContext(ctx).WithField("step", step.Name).Tracef("wait completed duration=%s", time.Since(start))
+	}
+	return state, err
 }
 
 //
@@ -243,6 +309,10 @@ func (e *Docker) create(ctx context.Context, spec *Spec, step *Step, output io.W
 	// by the process configuration, or if the image is :latest
 	if step.Pull == PullAlways ||
 		(step.Pull == PullDefault && image.IsLatest(step.Image)) {
+		if e.debug {
+			logger.FromContext(ctx).WithField("step", step.Name).WithField("image", step.Image).Debugln("pulling image")
+		}
+		start := time.Now()
 		rc, pullerr := e.client.ImagePull(ctx, step.Image, pullopts)
 		if pullerr == nil {
 			if e.hidePull {
@@ -251,10 +321,19 @@ func (e *Docker) create(ctx context.Context, spec *Spec, step *Step, output io.W
 				jsonmessage.Copy(rc, output)
 			}
 			rc.Close()
+			if e.trace {
+				logger.FromContext(ctx).WithField("step", step.Name).Tracef("image pull completed duration=%s", time.Since(start))
+			}
 		}
 		if pullerr != nil {
 			return pullerr
 		}
+	}
+
+	if e.trace {
+		conf := toConfig(spec, step)
+		hostConf := toHostConfig(spec, step)
+		logger.FromContext(ctx).WithField("step", step.Name).Tracef("container config image=%s mounts=%v", conf.Image, hostConf.Binds)
 	}
 
 	_, err := e.client.ContainerCreate(ctx,
